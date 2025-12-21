@@ -1,4 +1,4 @@
-# Star
+# A light in the darkness...
 
 An interactive canvas artwork that visualizes Ethereum's network burn rate as a flickering star, overlaid with text capturing the international sentiment of the Winter solstice in the northern hemisphere.
 
