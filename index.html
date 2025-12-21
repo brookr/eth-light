@@ -1,0 +1,439 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Star</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400&display=swap" rel="stylesheet">
+  <style>
+    html, body { margin:0; height:100%; background:#050408; overflow:hidden; }
+    body { touch-action:none; }
+    #wrap {
+      position:fixed; inset:0;
+      display:flex; align-items:center; justify-content:center;
+    }
+    canvas { display:block; background:transparent; }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="c"></canvas></div>
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+
+  // ---------- 5:7 portrait fit-to-viewport ----------
+  function resize() {
+    const vw = innerWidth, vh = innerHeight;
+    const targetAspect = 5/7;         // width/height
+    let cssW, cssH;
+    if (vw / vh > targetAspect) {
+      cssH = vh;
+      cssW = Math.floor(vh * targetAspect);
+    } else {
+      cssW = vw;
+      cssH = Math.floor(vw / targetAspect);
+    }
+    const dpr = Math.max(1, devicePixelRatio || 1);
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+  }
+  addEventListener("resize", resize);
+  resize();
+
+  // ---------- deterministic RNG (seeded) ----------
+  // For on-chain: you can inject tokenId/seed into this string from your ERC721 tokenURI()
+  const seedStr = (globalThis.TOKEN_SEED ?? "seed").toString();
+  let seed = 2166136261;
+  for (let i=0;i<seedStr.length;i++) seed = Math.imul(seed ^ seedStr.charCodeAt(i), 16777619);
+  function rand() { // xorshift32
+    seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+    return ((seed >>> 0) / 4294967296);
+  }
+  function clamp01(x){ return x<0?0:x>1?1:x; }
+  function smoothstep(a,b,x){
+    x = clamp01((x-a)/(b-a));
+    return x*x*(3-2*x);
+  }
+
+  // ---------- RPC & Burn Rate Logic ----------
+  const RPC_URLS = [
+    "https://cloudflare-eth.com",
+    "https://ethereum-rpc.publicnode.com",
+    "https://rpc.ankr.com/eth",
+  ];
+
+  function shuffled(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = (Math.random() * (i + 1)) | 0;
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  async function fetchJson(url, bodyObj, timeoutMs = 6000) {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(bodyObj),
+        signal: ac.signal,
+      });
+      const json = await res.json();
+      if (json.error) throw new Error(json.error.message || "RPC error");
+      return json.result;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function rpc(method, params = []) {
+    if (globalThis.ethereum?.request) {
+      return await ethereum.request({ method, params });
+    }
+    const urls = shuffled(RPC_URLS);
+    let lastErr;
+    for (const url of urls) {
+      try {
+        return await fetchJson(url, { jsonrpc: "2.0", id: 1, method, params });
+      } catch (e) {
+        lastErr = e;
+      }
+    }
+    throw lastErr || new Error("All RPC endpoints failed");
+  }
+
+  let burnRateTarget = 0.05; // Default "mid-range" brightness
+  let pointerHovering = false;
+  let touchActive = false;
+
+  function userIsControlling() {
+    return pointerHovering || touchActive;
+  }
+
+  async function updateBurnRate() {
+    try {
+      const block = await rpc('eth_getBlockByNumber', ['latest', false]);
+      if (block && block.baseFeePerGas) {
+        // 1. Execution Burn
+        const baseFeeWei = parseInt(block.baseFeePerGas, 16);
+        const gasUsed = parseInt(block.gasUsed, 16);
+        const executionBurnWei = BigInt(baseFeeWei) * BigInt(gasUsed);
+
+        // 2. Blob Burn
+        // blobBaseFeePerGas is often not in RPC, so we calc it from excessBlobGas
+        // Formula: y = MIN_BLOB_GASPRICE * e^(excessBlobGas / BLOB_GASPRICE_UPDATE_FRACTION)
+        // MIN_BLOB_GASPRICE = 1
+        // BLOB_GASPRICE_UPDATE_FRACTION = 3338477
+        let blobBurnWei = 0n;
+        // Prefer explicit blobBaseFeePerGas if available (EIP-4844 / Pectra support)
+        if (block.blobBaseFeePerGas) {
+            const blobBaseFee = parseInt(block.blobBaseFeePerGas, 16);
+            const blobGasUsed = block.blobGasUsed ? parseInt(block.blobGasUsed, 16) : 0;
+            blobBurnWei = BigInt(blobBaseFee) * BigInt(blobGasUsed);
+        }
+        else {
+            // Fallback: Fetch fee history to get the authentic blob fee
+            // verified to be correct (~0.001 Gwei) vs the broken excessBlobGas formula (~0.003 ETH)
+            try {
+                const history = await rpc('eth_feeHistory', [1, 'latest', []]);
+                if (history && history.baseFeePerBlobGas && history.baseFeePerBlobGas.length > 0) {
+                     // The array includes the *next* block's fee at the end, so we take the recent one.
+                     // usually history.baseFeePerBlobGas[0] corresponds to the requested block range start.
+                     const blobBaseFee = parseInt(history.baseFeePerBlobGas[0], 16);
+                     const blobGasUsed = block.blobGasUsed ? parseInt(block.blobGasUsed, 16) : 0;
+                     blobBurnWei = BigInt(blobBaseFee) * BigInt(blobGasUsed);
+                }
+            } catch (err) {
+                console.warn("Failed to fetch fee history fallback", err);
+            }
+        }
+
+        // 3. Total Burn (ETH)
+        // We use BigInt for precision, then convert to Number for brightness calc
+        const totalBurnWei = executionBurnWei + blobBurnWei;
+        const totalBurnEth = Number(totalBurnWei) / 1e18;
+
+        // 4. Brightness Mapping (Logarithmic)
+        // Midpoint: 0.0012 ETH (approx 0.08 Gwei mainnet / Solstice 2025 Baseline)
+        // Calibrated to "Solstice Midpoint" per user request (observed ~0.001 ETH avg)
+        const mid = 0.0012; 
+        const rangeScale = 100; // Factor of 100 dynamic range
+        const slope = 0.5 / Math.log(rangeScale);
+        
+        let brightness = 0.5 + slope * Math.log(Math.max(0.000001, totalBurnEth) / mid);
+        brightness = clamp01(brightness);
+
+        // yNorm is 0 at top (bright), 1 at bottom (dim).
+        // So target = 1.0 - brightness
+        if (!userIsControlling()) {
+            burnRateTarget = 1.0 - brightness;
+        }
+
+        console.log(`Burn: ${totalBurnEth.toFixed(6)} ETH (Exec: ${(Number(executionBurnWei)/1e18).toFixed(6)}, Blob: ${(Number(blobBurnWei)/1e18).toFixed(6)}), Brightness: ${brightness.toFixed(2)}`);
+      }
+    } catch (e) {
+      console.warn("Burn rate fetch failed", e);
+    }
+  }
+  
+  // Initial fetch and loop
+  updateBurnRate();
+  setInterval(updateBurnRate, 3000);
+
+  // ---------- pointer/touch input ----------
+  let yNormTarget = 0.5; // 0 top, 1 bottom
+  let yNorm = 0.5;
+
+  function setFromClientY(clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const y = (clientY - rect.top) / Math.max(1, rect.height);
+    yNormTarget = clamp01(y);
+  }
+
+  // Pointer events cover mouse + touch; touch-action none prevents scroll.
+  canvas.addEventListener("pointerenter", (e) => {
+    if (e.pointerType !== "touch") {
+      pointerHovering = true;
+      setFromClientY(e.clientY);
+    }
+  });
+
+  canvas.addEventListener("pointerdown", (e) => { 
+    e.preventDefault(); 
+    if (e.pointerType === "touch") touchActive = true;
+    else pointerHovering = true;
+    setFromClientY(e.clientY); 
+  }, {passive:false});
+  
+  canvas.addEventListener("pointermove", (e) => { 
+    e.preventDefault(); 
+    if (e.pointerType !== "touch") pointerHovering = true;
+    if (userIsControlling()) setFromClientY(e.clientY);
+  }, {passive:false});
+
+  canvas.addEventListener("pointerup",   (e) => { 
+    e.preventDefault(); 
+    if (e.pointerType === "touch") touchActive = false;
+  }, {passive:false});
+
+  canvas.addEventListener("pointercancel",(e)=> { 
+    e.preventDefault(); 
+    pointerHovering = false; 
+    touchActive = false; 
+  }, {passive:false});
+
+  canvas.addEventListener("pointerleave",()=> { 
+    pointerHovering = false; 
+    touchActive = false; 
+  });
+
+  // ---------- geometry helpers ----------
+  function starPath(cx, cy, outerR, innerR, points=5) {
+    ctx.beginPath();
+    const step = Math.PI / points;
+    let a = -Math.PI / 2;
+    for (let i=0;i<points*2;i++) {
+      const r = (i % 2 === 0) ? outerR : innerR;
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+      if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+      a += step;
+    }
+    ctx.closePath();
+  }
+
+  // Draw text along an arc, centered.
+  function drawTextOnArc(text, cx, cy, radius, startAngle, endAngle, opts) {
+    const { alpha=1, fill="#fff", fontPx=28, glow=false, align="center", clockwise=true } = opts || {};
+    if (!text) return;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = fill;
+    ctx.font = `${fontPx}px "EB Garamond", "Garamond", "Baskerville", "Palatino", "Times New Roman", serif`;
+    ctx.textBaseline = "middle";
+    ctx.textAlign = "center";
+    if (glow) {
+      ctx.shadowColor = fill;
+      ctx.shadowBlur = Math.max(2, fontPx * 0.6);
+    } else {
+      ctx.shadowBlur = 0;
+    }
+
+    const chars = [...text];
+    const arc = endAngle - startAngle;
+    const dir = clockwise ? 1 : -1;
+
+    // approximate spacing by measuring each char
+    const widths = chars.map(ch => ctx.measureText(ch).width);
+    const total = widths.reduce((a,b)=>a+b,0);
+    const pxPerRad = total / Math.max(0.001, Math.abs(arc)*radius);
+
+    // map cumulative widths to angles
+    let offset = 0;
+    // Center the text in the arc:
+    let angle = (startAngle + endAngle)/2 - dir * (total/(2*radius*pxPerRad)) * pxPerRad;
+
+    for (let i=0;i<chars.length;i++) {
+      const w = widths[i];
+      const ang = angle + dir * (offset + w/2) / radius;
+      const x = cx + Math.cos(ang) * radius;
+      const y = cy + Math.sin(ang) * radius;
+
+      ctx.save();
+      ctx.translate(x,y);
+      // rotate so letters are tangential
+      ctx.rotate(ang + (clockwise ? Math.PI/2 : -Math.PI/2));
+      ctx.fillText(chars[i], 0, 0);
+      ctx.restore();
+
+      offset += w;
+    }
+    ctx.restore();
+  }
+
+  // ---------- phrases ----------
+  const TOP_TEXT = "a light shines in the darkness";
+  const BOT_TEXT = "and the darkness has not overcome it";
+
+  // ---------- animation ----------
+  let t0 = performance.now();
+  let flicker = 0.6; // smoothed brightness
+
+  function frame(now) {
+    const t = (now - t0) / 1000;
+
+    // ease input
+    // ease input
+    const target = userIsControlling() ? yNormTarget : burnRateTarget;
+    yNorm += (target - yNorm) * 0.05; // slightly slower smoothing for organic feel
+
+    // brightness from position: top => bright, bottom => dim
+    const posB = 1 - yNorm; // 1 at top, 0 at bottom
+
+    // flicker signal (low-frequency, flame-like)
+    const base = 0.18 + 0.70 * posB;              // overall brightness range
+    const s1 = Math.sin(t * (2.1 + 0.3*rand())) * 0.10;
+    const s2 = Math.sin(t * 7.0) * 0.05;
+    const s3 = Math.sin(t * 13.2) * 0.02;
+    const jitter = (rand() - 0.5) * 0.03;
+    const raw = clamp01(base + s1 + s2 + s3 + jitter);
+    flicker += (raw - flicker) * 0.20;
+
+    const W = canvas.width, H = canvas.height;
+    const cx = W * 0.5;
+    const cy = H * 0.42;
+
+    // size responds to pointer height too (higher => bigger)
+    // size responds to pointer height too (higher => bigger)
+    const size = 0.55 + 0.65 * posB;
+    // START MODIFICATION: Reduced size from 0.10 to 0.075
+    const outerR = Math.min(W,H) * 0.075 * size * (0.85 + 0.35*flicker);
+    
+    // START MODIFICATION: Randomized flame-like pulsing
+    // Combine multiple sine waves and noise for organic breathing
+    const p1 = Math.sin(t * 2.5) * 0.03;
+    const p2 = Math.sin(t * 5.7) * 0.015;
+    const p3 = Math.sin(t * 11.3) * 0.005;
+    const pNoise = (rand() - 0.5) * 0.01;
+    const pulse = p1 + p2 + p3 + pNoise;
+    
+    // Base ratio 0.42, plus the chaotic pulse
+    const innerR = outerR * (0.42 + pulse);
+    // END MODIFICATION
+
+    // background
+    ctx.clearRect(0,0,W,H);
+    const vign = ctx.createRadialGradient(cx, cy, Math.min(W,H)*0.05, cx, cy, Math.min(W,H)*0.85);
+    vign.addColorStop(0, "#0b0710");
+    vign.addColorStop(1, "#020104");
+    ctx.fillStyle = vign;
+    ctx.fillRect(0,0,W,H);
+
+    // stars/specks (subtle, deterministic)
+    ctx.save();
+    ctx.globalAlpha = 0.10;
+    ctx.fillStyle = "#ffffff";
+    for (let i=0;i<60;i++){
+      const x = (rand()*W)|0, y = (rand()*H)|0;
+      const r = 1 + rand()*2;
+      ctx.globalAlpha = 0.03 + 0.08*rand();
+      ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+
+    // light pool around star (only really blooms when bright)
+    const lit = smoothstep(0.35, 0.85, flicker);
+    const glowR = outerR * (6.0 + 2.5*lit);
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
+    g.addColorStop(0, `rgba(255,230,180,${0.18 + 0.35*lit})`);
+    g.addColorStop(0.25, `rgba(255,170,110,${0.08 + 0.20*lit})`);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(0,0,W,H);
+    ctx.restore();
+
+    // star body
+    const twinkle = 0.75 + 0.35 * flicker;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.shadowColor = `rgba(255,200,120,${0.6*lit})`;
+    ctx.shadowBlur = outerR * (2.2 + 2.0*lit);
+
+    starPath(cx, cy, outerR, innerR, 5);
+    const starGrad = ctx.createRadialGradient(cx, cy - outerR*0.2, innerR*0.1, cx, cy, outerR*1.3);
+    starGrad.addColorStop(0, `rgba(255,255,245,${0.95})`);
+    starGrad.addColorStop(0.35, `rgba(255,235,200,${0.92})`);
+    starGrad.addColorStop(0.75, `rgba(255,170,95,${0.85})`);
+    starGrad.addColorStop(1, `rgba(90,35,20,${0.20})`);
+    ctx.fillStyle = starGrad;
+    ctx.globalAlpha = 0.75 + 0.25*twinkle;
+    ctx.fill();
+
+    // crisp outline (subtle)
+    ctx.globalCompositeOperation = "source-over";
+    ctx.globalAlpha = 0.10;
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = Math.max(1, Math.min(W,H)*0.002);
+    ctx.stroke();
+    ctx.restore();
+
+    // ---- TEXT: two-pass ----
+    // Baseline "ink" pass: barely visible at bottom, readable at mid.
+    const ink = 0.03 + 0.10 * smoothstep(0.10, 0.55, posB); // bottom ~0.03, mid+ ~0.13
+    const fontPx = Math.floor(Math.min(W,H) * 0.045);
+
+    const arcR = outerR * 2.6;
+    const topStart = -Math.PI * 0.95, topEnd = -Math.PI * 0.05;   // upper arc
+    const botStart =  Math.PI * 0.05, botEnd =  Math.PI * 0.95;   // lower arc
+
+    // dim ink
+    drawTextOnArc(TOP_TEXT, cx, cy, arcR, topStart, topEnd, { alpha: ink, fill:"#3a3343", fontPx, glow:false, clockwise:true });
+    drawTextOnArc(BOT_TEXT, cx, cy, arcR, botStart, botEnd, { alpha: ink, fill:"#3a3343", fontPx, glow:false, clockwise:false });
+
+    // lit pass: only shows when bright, and gets glow
+    const litText = 0.55 * smoothstep(0.45, 0.95, flicker);
+    if (litText > 0) {
+      drawTextOnArc(TOP_TEXT, cx, cy, arcR, topStart, topEnd, { alpha: litText, fill:"#ffe2b8", fontPx, glow:true, clockwise:true });
+      drawTextOnArc(BOT_TEXT, cx, cy, arcR, botStart, botEnd, { alpha: litText, fill:"#ffe2b8", fontPx, glow:true, clockwise:false });
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
