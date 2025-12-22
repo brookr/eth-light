@@ -3,8 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <meta name="author" content="brookr (https://6529.io/brookr)" />
+  <meta name="source" content="https://github.com/brookr/eth-light" />
   <title>Star</title>
-  <link rel="stylesheet" href="eb-garamond.css">
+  <link rel="stylesheet" href="tangerine.css">
   <style>
     html, body { margin:0; height:100%; background:#050408; overflow:hidden; }
     body { touch-action:none; }
@@ -44,10 +46,10 @@
   resize();
 
   // ---------- deterministic RNG (seeded) ----------
-  // For on-chain: you can inject tokenId/seed into this string from your ERC721 tokenURI()
-  const seedStr = (globalThis.TOKEN_SEED ?? "seed").toString();
-  let seed = 2166136261;
-  for (let i=0;i<seedStr.length;i++) seed = Math.imul(seed ^ seedStr.charCodeAt(i), 16777619);
+  // Seed from current Ethereum block number (fetched after rpc is defined)
+  let seed = 2166136261; // FNV-1a offset basis (fallback)
+  let seedInitialized = false;
+  
   function rand() { // xorshift32
     seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
     return ((seed >>> 0) / 4294967296);
@@ -63,6 +65,13 @@
     "https://cloudflare-eth.com",
     "https://ethereum-rpc.publicnode.com",
     "https://rpc.ankr.com/eth",
+    "https://eth.llamarpc.com",
+    "https://ethereum.blockpi.network/v1/rpc/public",
+    "https://rpc.flashbots.net",
+    "https://virginia.rpc.blxrbdn.com",
+    "https://uk.rpc.blxrbdn.com",
+    "https://singapore.rpc.blxrbdn.com",
+    "https://rpc.mevblocker.io",
   ];
 
   function shuffled(arr) {
@@ -93,15 +102,32 @@
     }
   }
 
+  let cachedRpcUrl = null; // Cache successful RPC endpoint
+  
   async function rpc(method, params = []) {
     if (globalThis.ethereum?.request) {
       return await ethereum.request({ method, params });
     }
+    
+    // Try cached URL first
+    if (cachedRpcUrl) {
+      try {
+        return await fetchJson(cachedRpcUrl, { jsonrpc: "2.0", id: 1, method, params });
+      } catch (e) {
+        // Cached URL failed, clear it and try others
+        cachedRpcUrl = null;
+      }
+    }
+    
+    // Try all URLs in random order
     const urls = shuffled(RPC_URLS);
     let lastErr;
     for (const url of urls) {
       try {
-        return await fetchJson(url, { jsonrpc: "2.0", id: 1, method, params });
+        const result = await fetchJson(url, { jsonrpc: "2.0", id: 1, method, params });
+        cachedRpcUrl = url; // Cache successful URL
+        console.log(`Using endpoint: ${url}`);
+        return result;
       } catch (e) {
         lastErr = e;
       }
@@ -112,6 +138,7 @@
   let burnRateTarget = 0.05; // Default "mid-range" brightness
   let pointerHovering = false;
   let touchActive = false;
+  let lastBlockNumber = null; // Track last block to avoid duplicate logs
 
   function userIsControlling() {
     return pointerHovering || touchActive;
@@ -121,6 +148,20 @@
     try {
       const block = await rpc('eth_getBlockByNumber', ['latest', false]);
       if (block && block.baseFeePerGas) {
+        const blockNumber = parseInt(block.number, 16);
+        
+        // Initialize RNG seed on first block (once per load)
+        if (!seedInitialized) {
+          seedInitialized = true;
+          const seedStr = blockNumber.toString();
+          seed = 2166136261;
+          for (let i=0;i<seedStr.length;i++) seed = Math.imul(seed ^ seedStr.charCodeAt(i), 16777619);
+          console.log(`RNG seeded with Ethereum block ${blockNumber}`);
+        }
+        
+        // Skip if we've already processed this block
+        if (blockNumber === lastBlockNumber) return;
+        lastBlockNumber = blockNumber;
         // 1. Execution Burn
         const baseFeeWei = parseInt(block.baseFeePerGas, 16);
         const gasUsed = parseInt(block.gasUsed, 16);
@@ -176,7 +217,7 @@
             burnRateTarget = 1.0 - brightness;
         }
 
-        console.log(`Burn: ${totalBurnEth.toFixed(6)} ETH (Exec: ${(Number(executionBurnWei)/1e18).toFixed(6)}, Blob: ${(Number(blobBurnWei)/1e18).toFixed(6)}), Brightness: ${brightness.toFixed(2)}`);
+        console.log(`Block ${blockNumber}: ${totalBurnEth.toFixed(4)} ETH burn, brightness ${brightness.toFixed(2)}`);
       }
     } catch (e) {
       console.warn("Burn rate fetch failed", e);
@@ -185,11 +226,128 @@
   
   // Initial fetch and loop
   updateBurnRate();
-  setInterval(updateBurnRate, 3000);
+  setInterval(updateBurnRate, 12000);
+
+  // ---------- TDH Vote Tracking for 6529 Main Stage (Top 50 by Rank) ----------
+  const WAVE_ID = "b6128077-ea78-4dd9-b381-52c4eadb2077";
+  const PAGE_SIZE = 50;
+  const PAGE = 1;
+  const SORT = "RANK";
+  const SORT_DIRECTION = "ASC";
+  const POLL_MS = 12000;
+  const WINDOW_MS = 3600000; // 1 hour
+  const SCORE_FIELD = "realtime_rating";
+  
+  const leaderboardUrl = () =>
+    `https://api.6529.io/api/waves/${WAVE_ID}/leaderboard` +
+    `?page_size=${PAGE_SIZE}&page=${PAGE}&sort=${SORT}&sort_direction=${SORT_DIRECTION}`;
+  
+  const lastScoreById = new Map();
+  let events = [];
+  let voteActivityScale = 0.0; // 0.0 = no activity, 1.0+ = high activity (logarithmic)
+  let voterCount = 0; // number of unique voters in last hour
+  
+  async function pollVotes() {
+    const now = Date.now();
+    events = events.filter((e) => now - e.t <= WINDOW_MS);
+    
+    let json;
+    try {
+      const res = await fetch(leaderboardUrl());
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      json = await res.json();
+    } catch (e) {
+      console.log(`[${new Date().toLocaleTimeString()}] TDH fetch error`, e);
+      return;
+    }
+    
+    const drops = Array.isArray(json.drops) ? json.drops : [];
+    const currentIds = new Set();
+    
+    for (const d of drops) {
+      const id = d.id;
+      currentIds.add(id);
+      const score = Number(d?.[SCORE_FIELD] ?? 0);
+      const prev = lastScoreById.get(id);
+      if (prev === undefined) {
+        lastScoreById.set(id, score);
+        continue;
+      }
+      const delta = score - prev;
+      if (delta !== 0) {
+        events.push({
+          t: now,
+          id,
+          rank: d.rank,
+          title: d.title || "(untitled)",
+          author: d?.author?.handle || "(unknown)",
+          delta,
+          newScore: score,
+        });
+        lastScoreById.set(id, score);
+      }
+    }
+    
+    // Cleanup: remove IDs that fell out of top 50 to prevent unbounded Map growth
+    for (const id of lastScoreById.keys()) {
+      if (!currentIds.has(id)) {
+        lastScoreById.delete(id);
+      }
+    }
+    
+    // Count unique voters (submissions with activity) in last hour
+    const uniqueSubmissions = new Set(events.map(e => e.id));
+    voterCount = uniqueSubmissions.size;
+    
+    // Aggregate deltas over last hour
+    const agg = new Map();
+    for (const e of events) {
+      const cur = agg.get(e.id) || {
+        title: e.title,
+        author: e.author,
+        rank: e.rank,
+        netDelta: 0,
+        newScore: e.newScore,
+      };
+      cur.netDelta += e.delta;
+      cur.newScore = e.newScore;
+      cur.rank = e.rank;
+      agg.set(e.id, cur);
+    }
+    
+    const rows = [...agg.values()]
+      .filter((r) => r.netDelta !== 0)
+      .sort((a, b) => Math.abs(b.netDelta) - Math.abs(a.netDelta));
+    
+    const totalInflow = rows.reduce((sum, r) => sum + r.netDelta, 0);
+    
+    // Logarithmic scaling for star size based on vote activity
+    // 10K votes = 0.0 (midrange), 100K votes = 1.0 (upper-mid), 1M votes = 2.0, 2M votes = 2.3
+    // Using log10 with a baseline of 10,000 TDH as "midrange" activity
+    const baseline = 10000;
+    if (totalInflow > 0) {
+      voteActivityScale = Math.log10(Math.max(1, totalInflow) / baseline);
+    } else {
+      voteActivityScale = 0.0;
+    }
+    
+    // Only log if there's activity
+    if (voterCount > 0 || totalInflow > 0) {
+      console.log(`TDH voted: ${totalInflow.toLocaleString()} from ${voterCount} submissions (${starPoints} points)`);
+    }
+  }
+  
+  pollVotes();
+  setInterval(pollVotes, POLL_MS);
 
   // ---------- pointer/touch input ----------
   let yNormTarget = 0.5; // 0 top, 1 bottom
   let yNorm = 0.5;
+  let xNormTarget = 0.5; // 0 left, 1 right
+  let xNorm = 0.5;
+  let starPoints = 4; // number of star points (base 4 + voter count)
+  let resetTimer = null;
+  let userOverridePoints = false; // track if user is manually controlling points
 
   function setFromClientY(clientY) {
     const rect = canvas.getBoundingClientRect();
@@ -197,11 +355,18 @@
     yNormTarget = clamp01(y);
   }
 
+  function setFromClientX(clientX) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (clientX - rect.left) / Math.max(1, rect.width);
+    xNormTarget = clamp01(x);
+  }
+
   // Pointer events cover mouse + touch; touch-action none prevents scroll.
   canvas.addEventListener("pointerenter", (e) => {
     if (e.pointerType !== "touch") {
       pointerHovering = true;
       setFromClientY(e.clientY);
+      setFromClientX(e.clientX);
     }
   });
 
@@ -209,13 +374,30 @@
     e.preventDefault(); 
     if (e.pointerType === "touch") touchActive = true;
     else pointerHovering = true;
-    setFromClientY(e.clientY); 
+    setFromClientY(e.clientY);
+    setFromClientX(e.clientX);
+    
+    // User is manually controlling points
+    userOverridePoints = true;
+    
+    // Increment star points on click/tap (max 42)
+    starPoints = Math.min(starPoints + 1, 42);
+    
+    // Reset timer: 6.9 seconds after last click
+    if (resetTimer) clearTimeout(resetTimer);
+    resetTimer = setTimeout(() => {
+      userOverridePoints = false;
+      starPoints = 4 + voterCount;
+    }, 6900);
   }, {passive:false});
   
   canvas.addEventListener("pointermove", (e) => { 
     e.preventDefault(); 
     if (e.pointerType !== "touch") pointerHovering = true;
-    if (userIsControlling()) setFromClientY(e.clientY);
+    if (userIsControlling()) {
+      setFromClientY(e.clientY);
+      setFromClientX(e.clientX);
+    }
   }, {passive:false});
 
   canvas.addEventListener("pointerup",   (e) => { 
@@ -227,11 +409,21 @@
     e.preventDefault(); 
     pointerHovering = false; 
     touchActive = false; 
+    
+    // Reset star points on cancel
+    if (resetTimer) clearTimeout(resetTimer);
+    userOverridePoints = false;
+    starPoints = 4 + voterCount;
   }, {passive:false});
 
   canvas.addEventListener("pointerleave",()=> { 
     pointerHovering = false; 
     touchActive = false; 
+    
+    // Reset star points when mouse leaves
+    if (resetTimer) clearTimeout(resetTimer);
+    userOverridePoints = false;
+    starPoints = 4 + voterCount;
   });
 
   // ---------- geometry helpers ----------
@@ -240,7 +432,15 @@
     const step = Math.PI / points;
     let a = -Math.PI / 2;
     for (let i=0;i<points*2;i++) {
-      const r = (i % 2 === 0) ? outerR : innerR;
+      let r;
+      if (i % 2 === 0) {
+        // Outer points (arms): alternate between full length and shorter (70%)
+        const armIndex = Math.floor(i / 2);
+        r = (armIndex % 2 === 0) ? outerR : outerR * 0.7;
+      } else {
+        // Inner points: always use innerR
+        r = innerR;
+      }
       const x = cx + Math.cos(a) * r;
       const y = cy + Math.sin(a) * r;
       if (i === 0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
@@ -265,7 +465,7 @@
 
     ctx.save();
     ctx.fillStyle = fillWithAlpha;
-    ctx.font = `${fontPx}px "EB Garamond", "Garamond", "Baskerville", "Palatino", "Times New Roman", serif`;
+    ctx.font = `${fontPx}px "Tangerine", cursive`;
     ctx.textBaseline = "middle";
     ctx.textAlign = "center";
     if (glow) {
@@ -318,10 +518,18 @@
   function frame(now) {
     const t = (now - t0) / 1000;
 
-    // ease input
+    // Update star points based on voter count (unless user is manually controlling)
+    if (!userOverridePoints) {
+      starPoints = 4 + voterCount;
+    }
+
     // ease input
     const target = userIsControlling() ? yNormTarget : burnRateTarget;
     yNorm += (target - yNorm) * 0.05; // slightly slower smoothing for organic feel
+    
+    // ease x input for size control
+    const xTarget = userIsControlling() ? xNormTarget : 0.5;
+    xNorm += (xTarget - xNorm) * 0.05;
 
     // brightness from position: top => bright, bottom => dim
     const posB = 1 - yNorm; // 1 at top, 0 at bottom
@@ -340,10 +548,24 @@
     const cy = H * 0.42;
 
     // size responds to pointer height too (higher => bigger)
-    // size responds to pointer height too (higher => bigger)
     const size = 0.55 + 0.65 * posB;
-    // START MODIFICATION: Reduced size from 0.10 to 0.075
-    const outerR = Math.min(W,H) * 0.075 * size * (0.85 + 0.35*flicker);
+    
+    // Size scaling: user x-coordinate overrides vote activity when controlling
+    // Vote activity scaling: start small (0.5x), grow logarithmically
+    // 0 votes = 0.5x, 10K votes = 1.0x, 100K votes = 2.0x, 1M+ votes = 4.0x
+    let voteScale;
+    if (userIsControlling()) {
+      // User control: left = 0.3x, center = 1.0x, right = 3.0x
+      voteScale = 0.3 + xNorm * 2.7;
+    } else {
+      voteScale = 0.5 + Math.max(0, voteActivityScale) * 0.5;
+    }
+    
+    // Base star size (for text arc calculation, unaffected by vote scaling)
+    const baseOuterR = Math.min(W,H) * 0.075 * size * (0.85 + 0.35*flicker);
+    
+    // Actual star size (scaled by vote activity)
+    const outerR = baseOuterR * voteScale;
     
     // START MODIFICATION: Randomized flame-like pulsing
     // Combine multiple sine waves and noise for organic breathing
@@ -353,8 +575,8 @@
     const pNoise = (rand() - 0.5) * 0.01;
     const pulse = p1 + p2 + p3 + pNoise;
     
-    // Base ratio 0.42, plus the chaotic pulse
-    const innerR = outerR * (0.42 + pulse);
+    // Base ratio 0.30 (thinner arms), plus the chaotic pulse
+    const innerR = outerR * (0.30 + pulse);
     // END MODIFICATION
 
     // background
@@ -397,7 +619,7 @@
     ctx.shadowColor = `rgba(255,200,120,${0.6*lit})`;
     ctx.shadowBlur = outerR * (2.2 + 2.0*lit);
 
-    starPath(cx, cy, outerR, innerR, 5);
+    starPath(cx, cy, outerR, innerR, starPoints);
     const starGrad = ctx.createRadialGradient(cx, cy - outerR*0.2, innerR*0.1, cx, cy, outerR*1.3);
     starGrad.addColorStop(0, `rgba(255,255,245,${0.95})`);
     starGrad.addColorStop(0.35, `rgba(255,235,200,${0.92})`);
@@ -418,9 +640,9 @@
     // ---- TEXT: two-pass ----
     // Baseline "ink" pass: barely visible at bottom, readable at mid.
     const ink = 0.03 + 0.10 * smoothstep(0.10, 0.55, posB); // bottom ~0.03, mid+ ~0.13
-    const fontPx = Math.floor(Math.min(W,H) * 0.045);
+    const fontPx = Math.floor(Math.min(W,H) * 0.069);
 
-    const arcR = outerR * 2.9;
+    const arcR = baseOuterR * 2.9;
     const topStart = -Math.PI * 0.95, topEnd = -Math.PI * 0.05;   // upper arc
     const botStart =  Math.PI * 0.05, botEnd =  Math.PI * 0.95;   // lower arc
 
