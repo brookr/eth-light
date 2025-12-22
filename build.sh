@@ -18,7 +18,7 @@ cat > build.html << 'EOF'
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
-<title>Star</title>
+<title>Eth Light</title>
 <style>
 @font-face{font-family:"Tangerine";src:url(data:font/woff2;base64,FONT_BASE64_PLACEHOLDER) format("woff2");font-weight:400;font-style:normal;}
 html,body{margin:0;height:100%;background:#050408;overflow:hidden}
