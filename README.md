@@ -1,10 +1,14 @@
 # A light in the darkness...
 
-An interactive canvas artwork that visualizes Ethereum's network burn rate and 6529 voting activity as a dynamic star, overlaid with flowing calligraphic text capturing the sentiment of light persisting through darkness.
+At the solstice, we wonder: will light return?
+
+This interactive artwork explores a sentiment felt across the northern hemisphere on the darkest day. Celebrated in many traditions, the return of the light unites us.
+
+Here, a solitary star visualizes the light: Ethereum's network burn rate and 6529 voting activity together form a dynamic star, overlaid with flowing calligraphic text expressing our persistence, even in darkness.
 
 ## Concept
 
-This piece translates blockchain activity into a contemplative visual metaphor: a multi-pointed star whose brightness responds to Ethereum's real-time burn data (base fee + blob burn), while its complexity reflects community engagement through 6529 TDH voting activity.
+This piece translates blockchain activity into a contemplative visual metaphor: a multi-pointed star whose brightness responds to Ethereum's real-time burn data (base fee + blob burn as a proxy for network utilization), while its complexity reflects community engagement through 6529 TDH voting activity.
 
 The star begins with 4 points and grows based on the number of submissions that received votes in the last hour, making it a living representation of collective creative participation. Each submission that gains votes adds one point to the star. 
 
@@ -15,8 +19,8 @@ The viewer can interact with the piece through touch or mouse, controlling both 
 ### Data Visualization
 
 - **Live Ethereum data**: Polls public RPC endpoints every 12 seconds for latest block burn metrics
+- **Logarithmic brightness mapping**: Calibrated to Solstice 2025 baseline (0.03 Gwei = 50% brightness, 10 Gwei = 100% brightness)
 - **TDH vote tracking**: Monitors top 50 submissions (by rank) on 6529 Main Stage, tracking vote changes
-- **Logarithmic brightness mapping**: Calibrated to Solstice 2025 baseline (~0.0012 ETH midpoint)
 - **Dynamic star complexity**: Point count = 4 + number of submissions with votes in last hour
 - **Logarithmic size scaling**: Star size grows with total TDH vote inflow (10K baseline, up to 2M+ max)
 

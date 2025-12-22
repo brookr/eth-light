@@ -202,10 +202,11 @@
         const totalBurnEth = Number(totalBurnWei) / 1e18;
 
         // 4. Brightness Mapping (Logarithmic)
-        // Midpoint: 0.0012 ETH (approx 0.08 Gwei mainnet / Solstice 2025 Baseline)
-        // Calibrated to "Solstice Midpoint" per user request (observed ~0.001 ETH avg)
-        const mid = 0.0012; 
-        const rangeScale = 100; // Factor of 100 dynamic range
+        // Midpoint: 0.00045 ETH total block burn (~0.03 Gwei base fee / Solstice 2025 Baseline)
+        // Range: 0.03 Gwei (50% bright) → 10 Gwei (100% bright)
+        // Fetches real base fee from RPC, calculates actual burn per block
+        const mid = 0.00045; 
+        const rangeScale = 333; // 333x range spans 0.03 to 10 Gwei
         const slope = 0.5 / Math.log(rangeScale);
         
         let brightness = 0.5 + slope * Math.log(Math.max(0.000001, totalBurnEth) / mid);
@@ -409,21 +410,11 @@
     e.preventDefault(); 
     pointerHovering = false; 
     touchActive = false; 
-    
-    // Reset star points on cancel
-    if (resetTimer) clearTimeout(resetTimer);
-    userOverridePoints = false;
-    starPoints = 4 + voterCount;
   }, {passive:false});
 
   canvas.addEventListener("pointerleave",()=> { 
     pointerHovering = false; 
     touchActive = false; 
-    
-    // Reset star points when mouse leaves
-    if (resetTimer) clearTimeout(resetTimer);
-    userOverridePoints = false;
-    starPoints = 4 + voterCount;
   });
 
   // ---------- geometry helpers ----------
